@@ -88,7 +88,7 @@ export function GemFinder() {
   const [onlyRewards, setOnlyRewards] = useState(false);
 
   useEffect(() => {
-    fetch("/src/scrapers/questRewards.json")
+    fetch("/questRewards.json")
       .then((response) => response.json())
       .then((data: QuestRewardsData) => setQuestRewards(data))
       .catch((error) => console.error("Erro ao carregar dados:", error));
