@@ -5,6 +5,7 @@ import type {
   QuestReward,
   CharacterClass,
 } from "../types/questRewards";
+import { loadPobBuild } from "../utils/pob";
 import "../styles/GemFinder.css";
 
 const CHARACTER_CLASSES: { value: CharacterClass; label: string }[] = [
@@ -69,14 +70,75 @@ const REMOVED_QUEST_REWARDS = [
   "Vilenta's Vengeance",
 ];
 
+interface GemInfo {
+  level: number;
+  attribute: string;
+  str: number;
+  dex: number;
+  int: number;
+}
+
+// Ex.: "21 Str / 14 Int"; se não houver números, cai para o nome do atributo
+function formatRequirements(info?: GemInfo) {
+  if (!info) return "-";
+  const parts = [
+    info.str > 0 && `${info.str} Str`,
+    info.dex > 0 && `${info.dex} Dex`,
+    info.int > 0 && `${info.int} Int`,
+  ].filter(Boolean);
+  if (parts.length > 0) return parts.join(" / ");
+  // Gemas de nível baixo começam com requisito 0 no atributo principal
+  const abbr: Record<string, string> = {
+    strength: "Str",
+    dexterity: "Dex",
+    intelligence: "Int",
+  };
+  return abbr[info.attribute] ? `0 ${abbr[info.attribute]}` : "-";
+}
+
+const ATTRIBUTE_COLORS: Record<string, string> = {
+  strength: "#e05a4b",
+  dexterity: "#5ec26a",
+  intelligence: "#6b9eff",
+};
+
+const STORAGE_KEY = "poe-gem:build";
+
+interface SavedBuild {
+  selectedClass: CharacterClass | "";
+  selectedGems: { label: string; value: string }[];
+}
+
+// localStorage pode falhar (modo privado, dados bloqueados); nesse caso segue sem cache
+function loadSavedBuild(): SavedBuild {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) {
+      const data = JSON.parse(raw);
+      if (Array.isArray(data.selectedGems)) {
+        return {
+          selectedClass: data.selectedClass || "",
+          selectedGems: data.selectedGems,
+        };
+      }
+    }
+  } catch {
+    /* ignora */
+  }
+  return { selectedClass: "", selectedGems: [] };
+}
+
 export function GemFinder() {
+  const [saved] = useState(loadSavedBuild);
   const [questRewards, setQuestRewards] = useState<QuestRewardsData | null>(
     null
   );
-  const [selectedClass, setSelectedClass] = useState<CharacterClass | "">("");
+  const [selectedClass, setSelectedClass] = useState<CharacterClass | "">(
+    saved.selectedClass
+  );
   const [selectedGems, setSelectedGems] = useState<
     { label: string; value: string }[]
-  >([]);
+  >(saved.selectedGems);
   const [results, setResults] = useState<{
     quests: QuestReward[];
     vendors: QuestReward[];
@@ -86,6 +148,25 @@ export function GemFinder() {
   const [hideLilly, setHideLilly] = useState(false);
   const [onlyVendors, setOnlyVendors] = useState(false);
   const [onlyRewards, setOnlyRewards] = useState(false);
+  // Ordem real de progressão das quests por ato (public/questOrder.json)
+  const [questOrder, setQuestOrder] = useState<Record<string, string[]>>({});
+  const [pobInput, setPobInput] = useState("");
+  const [pobStatus, setPobStatus] = useState("");
+  const [gemInfo, setGemInfo] = useState<Record<string, GemInfo>>({});
+
+  useEffect(() => {
+    fetch("/questOrder.json")
+      .then((response) => response.json())
+      .then((data: Record<string, string[]>) => setQuestOrder(data))
+      .catch((error) => console.error("Erro ao carregar questOrder:", error));
+  }, []);
+
+  useEffect(() => {
+    fetch("/gemInfo.json")
+      .then((response) => response.json())
+      .then((data: Record<string, GemInfo>) => setGemInfo(data))
+      .catch((error) => console.error("Erro ao carregar gemInfo:", error));
+  }, []);
 
   useEffect(() => {
     fetch("/questRewards.json")
@@ -142,6 +223,61 @@ export function GemFinder() {
     return Array.from(gemsSet).sort((a, b) => a.localeCompare(b));
   }, [questRewards]);
 
+  // Salva a build atual para não precisar importar de novo ao reabrir
+  useEffect(() => {
+    try {
+      if (selectedClass || selectedGems.length > 0) {
+        localStorage.setItem(
+          STORAGE_KEY,
+          JSON.stringify({ selectedClass, selectedGems })
+        );
+      } else {
+        localStorage.removeItem(STORAGE_KEY);
+      }
+    } catch {
+      /* ignora */
+    }
+  }, [selectedClass, selectedGems]);
+
+  function clearBuild() {
+    setSelectedClass("");
+    setSelectedGems([]);
+    setPobInput("");
+    setPobStatus("");
+  }
+
+  async function importPob() {
+    if (!pobInput.trim()) return;
+    setPobStatus("Carregando...");
+    try {
+      const build = await loadPobBuild(pobInput);
+      const byName = new Map(allGems.map((g) => [g.toLowerCase(), g]));
+      const found: string[] = [];
+      const ignored: string[] = [];
+      for (const name of build.gems) {
+        // Suportes no PoB vêm sem o sufixo "Support"
+        const match =
+          byName.get(name.toLowerCase()) ??
+          byName.get(`${name} Support`.toLowerCase());
+        if (match) found.push(match);
+        else ignored.push(name);
+      }
+      const cls = build.className.toLowerCase();
+      if (isCharacterClass(cls)) setSelectedClass(cls);
+      setSelectedGems(
+        [...new Set(found)].map((g) => ({ value: g, label: g }))
+      );
+      setPobStatus(
+        `${found.length} gemas adicionadas` +
+          (ignored.length > 0
+            ? `; ${ignored.length} fora das quests/vendors: ${ignored.join(", ")}`
+            : "")
+      );
+    } catch (e) {
+      setPobStatus(`Erro ao importar: ${(e as Error).message}`);
+    }
+  }
+
   const gemOptions = selectedClass
     ? allGems.map((gem) => ({ value: gem, label: gem }))
     : [];
@@ -186,10 +322,19 @@ export function GemFinder() {
     vendors: QuestReward[]
   ) {
     if (!isCharacterClass(selectedClass)) return [];
-    return selectedGems.map((gemObj) => {
+
+    // Posição na progressão do jogo: ato e, dentro dele, a ordem da quest nos dados.
+    // Vendors contam logo depois da quest a que estão ligados.
+    const progressKey = (r: QuestReward) => {
+      const idx = (questOrder[r.act] ?? []).indexOf(r.quest);
+      return r.act * 10000 + (idx === -1 ? 0 : idx) * 2 + (r.rewardType === "vendor" ? 1 : 0);
+    };
+
+    const rows = selectedGems.map((gemObj) => {
       const gem = gemObj.value;
+
       // Quests onde a gema é recompensa (removendo as da lista)
-      const questRewards = quests
+      const questRewardsList = quests
         .filter(
           (q: QuestReward) =>
             isCharacterClass(selectedClass) &&
@@ -198,9 +343,20 @@ export function GemFinder() {
             ) &&
             !REMOVED_QUEST_REWARDS.includes(q.quest)
         )
-        .map((q: QuestReward) => `Ato ${q.act} - ${q.quest}`);
+        .sort((x, y) => progressKey(x) - progressKey(y));
+
+      // Pega o menor ato dos quest rewards para ordenação
+      const minActFromQuests =
+        questRewardsList.length > 0
+          ? Math.min(...questRewardsList.map((q) => q.act))
+          : Infinity;
+
+      const questRewards = questRewardsList.map(
+        (q: QuestReward) => `Ato ${q.act} - ${q.quest}`
+      );
+
       // Vendors onde a gema pode ser comprada
-      const vendorRewards = vendors
+      const vendorList = vendors
         .filter((v: QuestReward) => {
           if (
             hideSiosa &&
@@ -223,22 +379,76 @@ export function GemFinder() {
             )
           );
         })
-        .map(
-          (v: QuestReward) =>
-            `${v.vendor} - Ato ${v.act}${v.quest ? " - After " + v.quest : ""}`
-        );
+        .sort((x, y) => progressKey(x) - progressKey(y));
+
+      const vendorRewards = vendorList.map(
+        (v: QuestReward) =>
+          `${v.vendor} - Ato ${v.act}${v.quest ? " - After " + v.quest : ""}`
+      );
+
+      // Ordem pela quest reward; sem quest reward vai para o fim (por vendor)
+      const questKey = Math.min(...questRewardsList.map(progressKey));
+      const vendorKey = Math.min(...vendorList.map(progressKey));
+
       return {
         gem,
         quests: questRewards,
         vendors: vendorRewards,
+        minAct: minActFromQuests,
+        questKey,
+        vendorKey,
       };
     });
+
+    // Da primeira quest reward até a última; sem quest reward ficam no fim.
+    // Math.min([]) = Infinity, e Infinity - Infinity = NaN, por isso comparamos à mão.
+    const cmp = (x: number, y: number) =>
+      x === y ? 0 : x === Infinity ? 1 : y === Infinity ? -1 : x - y;
+    rows.sort(
+      (a, b) =>
+        cmp(a.questKey, b.questKey) ||
+        cmp(a.vendorKey, b.vendorKey) ||
+        a.gem.localeCompare(b.gem)
+    );
+    return rows;
   }
 
   return (
     <div className="gem-finder">
       <h1>PoE Gem Finder</h1>
       <div className="finder-form">
+        <div className="finder-field" style={{ marginBottom: "1.2rem" }}>
+          <div style={{ display: "flex", gap: "0.5rem", width: 350, flexWrap: "wrap" }}>
+            <input
+              type="text"
+              value={pobInput}
+              onChange={(e) => setPobInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && importPob()}
+              placeholder="Link do pobb.in ou código do PoB"
+              style={{
+                flex: 1,
+                background: "#232323",
+                border: "1px solid #af6025",
+                borderRadius: 4,
+                color: "#c8beb7",
+                padding: "0.4rem 0.6rem",
+              }}
+            />
+            <button type="button" onClick={importPob} disabled={!allGems.length}>
+              Importar
+            </button>
+            {(selectedClass || selectedGems.length > 0) && (
+              <button type="button" onClick={clearBuild}>
+                Remover build
+              </button>
+            )}
+          </div>
+          {pobStatus && (
+            <p style={{ fontSize: "0.8em", margin: "0.4rem 0 0", maxWidth: 350 }}>
+              {pobStatus}
+            </p>
+          )}
+        </div>
         <div className="finder-field" style={{ marginBottom: "1.2rem" }}>
           <Select
             id="class-select"
@@ -428,6 +638,7 @@ export function GemFinder() {
               results.quests,
               results.vendors
             );
+            // Aplica os filtros
             if (onlyVendors) {
               rows = rows.filter(
                 (row) => row.quests.length === 0 && row.vendors.length > 0
@@ -436,6 +647,7 @@ export function GemFinder() {
             if (onlyRewards) {
               rows = rows.filter((row) => row.quests.length > 0);
             }
+
             if (rows.length === 0) {
               return <p className="no-results">No results found.</p>;
             }
@@ -444,6 +656,8 @@ export function GemFinder() {
                 <thead>
                   <tr>
                     <th>Gema</th>
+                    <th>Level</th>
+                    <th>Atributo</th>
                     {!onlyVendors && <th>Quest Rewards</th>}
                     <th>Vendor</th>
                   </tr>
@@ -452,6 +666,15 @@ export function GemFinder() {
                   {rows.map((row, idx) => (
                     <tr key={row.gem + idx}>
                       <td>{row.gem}</td>
+                      <td>{gemInfo[row.gem]?.level ?? "-"}</td>
+                      <td
+                        style={{
+                          color: ATTRIBUTE_COLORS[gemInfo[row.gem]?.attribute],
+                          textTransform: "capitalize",
+                        }}
+                      >
+                        {formatRequirements(gemInfo[row.gem])}
+                      </td>
                       {!onlyVendors && (
                         <td>
                           {row.quests.length > 0 ? (
