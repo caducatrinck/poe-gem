@@ -20,7 +20,9 @@ export async function loadPobBuild(input: string): Promise<PobBuild> {
   const link = text.match(/^https?:\/\/pobb\.in\/([A-Za-z0-9_-]+)/);
   if (link) {
     const res = await fetch(`/pobb/${link[1]}/raw`);
-    if (!res.ok) throw new Error(`pobb.in respondeu ${res.status}`);
+    if (!res.ok) {
+      throw new Error(`pobb.in respondeu ${res.status} para "${link[1]}"`);
+    }
     code = await res.text();
   }
   const xml = await decodePobCode(code);

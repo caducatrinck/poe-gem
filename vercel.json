@@ -1,0 +1,5 @@
+{
+  "rewrites": [
+    { "source": "/pobb/:path*", "destination": "https://pobb.in/:path*" }
+  ]
+}
